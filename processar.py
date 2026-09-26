@@ -38,6 +38,10 @@ UFS = set(UF_POR_CODIGO_IBGE.values())
 COLUNAS = ["cnpj", "razao", "fantasia", "cnae", "cnaes2", "logradouro", "numero", "complemento",
            "bairro", "cep", "municipio", "uf", "tel1", "tel2", "email", "inicio", "matriz"]
 
+# O servidor da Receita derruba conexões que não parecem de navegador.
+NAVEGADOR = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+TOKEN_CONHECIDO = "gn672Ad4CF8N6TK"
+
 TRABALHO = os.environ.get("TRABALHO", "trabalho")
 SAIDA = os.environ.get("SAIDA", "saida")
 
@@ -49,17 +53,30 @@ def log(*partes):
 # ------------------------------------------------------------ onde baixar
 
 
+def _curl(url, *extras):
+    """Pede via curl (com cara de navegador e tentativas) e devolve (código, corpo)."""
+    comando = ["curl", "-sS", "-L", "--retry", "4", "--retry-delay", "8", "--retry-all-errors",
+               "--max-time", "180", "-A", NAVEGADOR, "-w", "\n%{http_code} %{url_effective}", url] + list(extras)
+    saida = subprocess.run(comando, capture_output=True, timeout=900)
+    texto = saida.stdout.decode("utf-8", errors="replace")
+    corpo, _, fim = texto.rpartition("\n")
+    return fim, corpo
+
+
 def descobrir_token():
     """O compartilhamento público da Receita tem um código que pode mudar.
     A página inicial redireciona pra ele: .../index.php/s/<código>."""
     if os.environ.get("RECEITA_TOKEN"):
         return os.environ["RECEITA_TOKEN"]
-    with urllib.request.urlopen(RAIZ + "/", timeout=60) as r:
-        final = r.geturl()
-    achado = re.search(r"/s/([A-Za-z0-9]+)", final)
-    if not achado:
-        raise SystemExit("Não achei o código do compartilhamento da Receita em %s" % final)
-    return achado.group(1)
+    try:
+        fim, _ = _curl(RAIZ + "/", "-o", "/dev/null")
+        achado = re.search(r"/s/([A-Za-z0-9]+)", fim)
+        if achado:
+            return achado.group(1)
+        log("não achei o código na resposta (%s); usando o conhecido" % fim)
+    except Exception as erro:  # noqa: BLE001
+        log("falha ao descobrir o código (%s); usando o conhecido" % erro)
+    return TOKEN_CONHECIDO
 
 
 def _auth(token):
@@ -68,11 +85,11 @@ def _auth(token):
 
 
 def listar(token, caminho):
-    req = urllib.request.Request(RAIZ + "/public.php/webdav" + caminho, method="PROPFIND",
-                                 headers={"Depth": "1", "Authorization": _auth(token)})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        xml = r.read()
-    arvore = ElementTree.fromstring(xml)
+    fim, xml = _curl(RAIZ + "/public.php/webdav" + urllib.request.quote(caminho), "-X", "PROPFIND",
+                     "-H", "Depth: 1", "-u", token + ":")
+    if not fim.startswith("207"):
+        raise SystemExit("A Receita não listou %s (resposta %s)" % (caminho, fim))
+    arvore = ElementTree.fromstring(xml.encode("utf-8"))
     ns = {"d": "DAV:"}
     itens = []
     for resp in arvore.findall("d:response", ns):
@@ -93,8 +110,8 @@ def baixar(token, caminho, destino):
     """curl com retomada: os arquivos têm centenas de MB e a conexão da Receita cai."""
     url = RAIZ + "/public.php/webdav" + urllib.request.quote(caminho)
     for tentativa in range(6):
-        codigo = subprocess.call(["curl", "-fsSL", "--retry", "5", "--retry-delay", "10",
-                                  "-C", "-", "-u", token + ":", "-o", destino, url])
+        codigo = subprocess.call(["curl", "-fsSL", "--retry", "5", "--retry-delay", "10", "--retry-all-errors",
+                                  "-A", NAVEGADOR, "-C", "-", "-u", token + ":", "-o", destino, url])
         if codigo in (0, 33):  # 33 = servidor não aceita retomar, mas o arquivo já veio inteiro
             return
         log("download falhou (%s), tentando de novo: %s" % (codigo, caminho))
