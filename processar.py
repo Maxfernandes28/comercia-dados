@@ -1,6 +1,7 @@
 """Separa a base aberta de CNPJ da Receita por estado e atividade.
 
-Roda uma vez por mês no GitHub Actions (ver .github/workflows/receita.yml).
+Roda uma vez por mês num computador no Brasil (a Receita recusa conexões de fora);
+no dia a dia quem roda é atualizar_local.py, em passos curtos.
 Baixa os arquivos que a Receita publica, fica só com as empresas ATIVAS e
 grava um arquivo por estado e por divisão de atividade (os 2 primeiros
 dígitos do CNAE principal: 47 = comércio varejista, 86 = saúde...). Cada
@@ -154,7 +155,7 @@ class Baldes:
         os.makedirs(pasta, exist_ok=True)
 
     def caminho(self, uf, div):
-        return os.path.join(self.pasta, "%s_%s.csv" % (uf, div))
+        return os.path.join(self.pasta, "%s_%s.csv.gz" % (uf, div))
 
     def por(self, uf, div, linha):
         chave = (uf, div)
@@ -166,10 +167,86 @@ class Baldes:
 
     def despejar(self):
         for (uf, div), linhas in self.buffer.items():
-            with open(self.caminho(uf, div), "a", encoding="utf-8", newline="") as f:
+            # gzip em modo "a" junta um bloco novo no fim; quem lê vê um arquivo só.
+            with gzip.open(self.caminho(uf, div), "at", encoding="utf-8", newline="") as f:
                 csv.writer(f, delimiter=";").writerows(linhas)
         self.buffer = {}
         self.guardadas = 0
+
+
+class Razoes:
+    """Razão social de quem está ativo, sem estourar a memória.
+
+    O computador que roda isso pode ter pouca memória (2-3 GB), e são uns
+    25 milhões de empresas. Então: os códigos que interessam vão pra um
+    arquivo de números (4 bytes cada), ordenados com numpy; as razões
+    encontradas vão pra um SQLite em disco, consultado no fim.
+    """
+
+    def __init__(self, pasta):
+        import sqlite3
+        self.pasta = pasta
+        self.lista_caminho = os.path.join(pasta, "basicos.u32")
+        self.lista = open(self.lista_caminho, "wb")
+        self.buffer = []
+        self.db_caminho = os.path.join(pasta, "razoes.db")
+        if os.path.exists(self.db_caminho):
+            os.remove(self.db_caminho)
+        self.db = sqlite3.connect(self.db_caminho)
+        self.db.execute("PRAGMA journal_mode=OFF")
+        self.db.execute("PRAGMA synchronous=OFF")
+        self.db.execute("CREATE TABLE r (b INTEGER PRIMARY KEY, razao TEXT)")
+        self.ordenados = None
+
+    def quero(self, basico):
+        self.buffer.append(int(basico))
+        if len(self.buffer) >= 500000:
+            self._despejar()
+
+    def _despejar(self):
+        import array
+        array.array("I", self.buffer).tofile(self.lista)
+        self.buffer = []
+
+    def fechar_lista(self):
+        import numpy
+        self._despejar()
+        self.lista.close()
+        self.ordenados = numpy.unique(numpy.fromfile(self.lista_caminho, dtype=numpy.uint32))
+        os.remove(self.lista_caminho)
+        log("empresas ativas distintas: %d" % len(self.ordenados))
+
+    def guardar(self, pares):
+        import numpy
+        lote = []
+        for basico, razao in pares:
+            if basico.isdigit():
+                lote.append((int(basico), razao))
+            if len(lote) >= 500000:
+                self._guardar_lote(numpy, lote)
+                lote = []
+        if lote:
+            self._guardar_lote(numpy, lote)
+
+    def _guardar_lote(self, numpy, lote):
+        codigos = numpy.fromiter((b for b, _ in lote), dtype=numpy.uint32, count=len(lote))
+        pos = numpy.searchsorted(self.ordenados, codigos)
+        pos[pos >= len(self.ordenados)] = 0
+        achou = self.ordenados[pos] == codigos
+        self.db.executemany("INSERT OR REPLACE INTO r VALUES (?, ?)",
+                            (lote[i] for i in numpy.nonzero(achou)[0]))
+        self.db.commit()
+
+    def quantas(self):
+        return self.db.execute("SELECT COUNT(*) FROM r").fetchone()[0]
+
+    def de(self, basico):
+        linha = self.db.execute("SELECT razao FROM r WHERE b = ?", (int(basico),)).fetchone()
+        return linha[0] if linha else ""
+
+    def apagar(self):
+        self.db.close()
+        os.remove(self.db_caminho)
 
 
 def processar(token, mes, baixar_arquivo=baixar):
@@ -183,7 +260,7 @@ def processar(token, mes, baixar_arquivo=baixar):
         raise SystemExit("Faltam arquivos na pasta %s" % mes)
 
     baldes = Baldes(os.path.join(TRABALHO, "baldes"))
-    basicos = set()
+    razoes = Razoes(TRABALHO)
     total = ativas = 0
     for caminho in estab:
         local = os.path.join(TRABALHO, os.path.basename(caminho))
@@ -199,7 +276,7 @@ def processar(token, mes, baixar_arquivo=baixar):
             if uf not in UFS or len(cnae) < 7:
                 continue
             ativas += 1
-            basicos.add(l[0])
+            razoes.quero(l[0])
             baldes.por(uf, cnae[:2], [
                 l[0] + l[1] + l[2], "", _limpo(l[4]), cnae, (l[12] or "").strip(),
                 _limpo(((l[13] or "") + " " + (l[14] or ""))), _limpo(l[15]), _limpo(l[16]),
@@ -211,17 +288,14 @@ def processar(token, mes, baixar_arquivo=baixar):
         os.remove(local)
         log("até aqui: %d lidas, %d ativas" % (total, ativas))
 
-    razoes = {}
+    razoes.fechar_lista()
     for caminho in empresas:
         local = os.path.join(TRABALHO, os.path.basename(caminho))
         log("baixando", caminho)
         baixar_arquivo(token, caminho, local)
-        for l in linhas_do_zip(local):
-            if l and l[0] in basicos:
-                razoes[l[0]] = _limpo(l[1])
+        razoes.guardar((l[0], _limpo(l[1])) for l in linhas_do_zip(local) if len(l) >= 2)
         os.remove(local)
-        log("razões sociais: %d" % len(razoes))
-    del basicos
+        log("razões sociais: %d" % razoes.quantas())
 
     os.makedirs(SAIDA, exist_ok=True)
     meta = {"mes": mes.rstrip("/").rsplit("/", 1)[-1], "gerado_em": datetime.datetime.utcnow().isoformat() + "Z",
@@ -229,16 +303,16 @@ def processar(token, mes, baixar_arquivo=baixar):
     for (uf, div), n in sorted(baldes.contagem.items()):
         pasta = os.path.join(SAIDA, uf.lower())
         os.makedirs(pasta, exist_ok=True)
-        with open(baldes.caminho(uf, div), encoding="utf-8", newline="") as ent, \
+        with gzip.open(baldes.caminho(uf, div), "rt", encoding="utf-8", newline="") as ent, \
                 gzip.open(os.path.join(pasta, "%s.csv.gz" % div), "wt", encoding="utf-8", newline="") as sai:
             escritor = csv.writer(sai, delimiter=";")
             escritor.writerow(COLUNAS)
             for linha in csv.reader(ent, delimiter=";"):
-                linha[1] = razoes.get(linha[0][:8], "")
+                linha[1] = razoes.de(linha[0][:8])
                 escritor.writerow(linha)
         os.remove(baldes.caminho(uf, div))
         meta["ufs"].setdefault(uf, {})[div] = n
-    del razoes
+    razoes.apagar()
 
     base = os.path.join(SAIDA, "base")
     os.makedirs(base, exist_ok=True)
@@ -282,8 +356,92 @@ def municipios(nomes_receita, destino, fonte=None):
                                l["latitude"], l["longitude"], l["codigo_ibge"]])
 
 
+REPO = os.environ.get("DADOS_REPO", "Maxfernandes28/comercia-dados")
+NOTA = "Empresas ativas da base aberta da Receita Federal, separadas por atividade (divisão do CNAE). Gerado automaticamente."
+
+
+def _gh(metodo, url, token, corpo=None, tipo="application/json"):
+    import json as _json
+    dados = None
+    if corpo is not None:
+        dados = corpo if isinstance(corpo, bytes) else _json.dumps(corpo).encode("utf-8")
+    req = urllib.request.Request(url, data=dados, method=metodo, headers={
+        "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "Content-Type": tipo, "User-Agent": "comercia-dados"})
+    for tentativa in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                texto = r.read()
+                return _json.loads(texto) if texto else {}
+        except urllib.error.HTTPError as erro:
+            if erro.code == 404:
+                return None
+            if erro.code in (500, 502, 503, 504) and tentativa < 4:
+                import time
+                time.sleep(10 * (tentativa + 1))
+                continue
+            raise SystemExit("GitHub respondeu %s em %s: %s" % (erro.code, url, erro.read()[:300]))
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as erro:
+            if tentativa < 4:
+                import time
+                time.sleep(10 * (tentativa + 1))
+                continue
+            raise SystemExit("Sem conexão com o GitHub: %s" % erro)
+
+
+def publicar(token, saida=None):
+    """Troca as releases pelas novas: apaga a do estado e cria de novo (uma
+    chamada por arquivo), pra ficar dentro do limite de chamadas do GitHub."""
+    import time
+    saida = saida or SAIDA
+    api = os.environ.get("GH_API", "https://api.github.com") + "/repos/" + REPO
+    pastas = sorted(p for p in os.listdir(saida) if os.path.isdir(os.path.join(saida, p)))
+    # "base" por último: o meta.json novo só aparece quando todo o resto já subiu.
+    pastas = [p for p in pastas if p != "base"] + (["base"] if "base" in pastas else [])
+    for tag in pastas:
+        antiga = _gh("GET", api + "/releases/tags/" + tag, token)
+        if antiga:
+            _gh("DELETE", api + "/releases/%d" % antiga["id"], token)
+        if _gh("GET", api + "/git/refs/tags/" + tag, token):
+            _gh("DELETE", api + "/git/refs/tags/" + tag, token)
+        nova = _gh("POST", api + "/releases", token, {"tag_name": tag, "name": tag, "body": NOTA,
+                                                      "target_commitish": "main"})
+        arquivos = sorted(os.listdir(os.path.join(saida, tag)), key=lambda n: (n == "meta.json", n))
+        for nome in arquivos:
+            with open(os.path.join(saida, tag, nome), "rb") as f:
+                conteudo = f.read()
+            tipo = "application/json" if nome.endswith(".json") else "application/gzip"
+            url = "%s/repos/%s/releases/%d/assets?name=%s" % (os.environ.get("GH_UPLOADS", "https://uploads.github.com"),
+                                                            REPO, nova["id"], urllib.request.quote(nome))
+            _gh("POST", url, token, conteudo, tipo)
+        log("publicado %s: %d arquivos" % (tag, len(arquivos)))
+        time.sleep(1)
+
+
+def _ler_token():
+    if os.environ.get("GITHUB_TOKEN"):
+        return os.environ["GITHUB_TOKEN"].strip()
+    arquivo = os.environ.get("TOKEN_ARQUIVO")
+    if arquivo and os.path.exists(arquivo):
+        return open(arquivo, encoding="utf-8").read().strip()
+    return None
+
+
 if __name__ == "__main__":
-    token = descobrir_token()
-    mes = sys.argv[1] if len(sys.argv) > 1 else mes_mais_recente(token)
-    log("compartilhamento", token, "pasta", mes)
-    processar(token, mes)
+    import argparse
+    args = argparse.ArgumentParser()
+    args.add_argument("pasta", nargs="?", help="pasta do mês na Receita (vazio = a mais recente)")
+    args.add_argument("--publicar", action="store_true", help="publica no GitHub no fim")
+    args.add_argument("--so-publicar", action="store_true", help="só publica o que já está em SAIDA")
+    a = args.parse_args()
+    if not a.so_publicar:
+        token = descobrir_token()
+        mes = a.pasta or mes_mais_recente(token)
+        log("compartilhamento", token, "pasta", mes)
+        processar(token, mes)
+    if a.publicar or a.so_publicar:
+        gh = _ler_token()
+        if not gh:
+            raise SystemExit("Falta a chave do GitHub (GITHUB_TOKEN ou TOKEN_ARQUIVO).")
+        publicar(gh)
+        log("tudo publicado")
